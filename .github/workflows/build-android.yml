@@ -1,0 +1,50 @@
+name: Build Android (self)
+
+# 放到 fork 的 .github/workflows/ 下：提交后自动运行，也可在 Actions 页手动运行。
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/build-android.yml"]
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - name: Android SDK / NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-linux-android }
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri android init --ci
+      # ponytail: 只编 arm64（几乎所有现代手机），需要 armv7/x86_64 再往 --target 后面加
+      - run: pnpm tauri android build --apk --target aarch64
+
+      # 一次性密钥签名：每次运行密钥都不同，升级时需先卸载旧版
+      - name: Sign
+        run: |
+          KS="$RUNNER_TEMP/tmp.keystore"
+          keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+            -alias self -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=self-build"
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          APK="$(find src-tauri/gen/android/app/build/outputs/apk -name '*-release*.apk' | head -1)"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign --ks "$KS" --ks-pass pass:android \
+            --out HGhub-self-arm64.apk "$APK"
+          sha256sum HGhub-self-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with: { name: HGhub-android, path: HGhub-self-arm64.apk }
